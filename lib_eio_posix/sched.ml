@@ -21,20 +21,10 @@ module Fiber_context = Eio.Private.Fiber_context
 module Trace = Eio.Private.Trace
 module Rcfd = Eio_unix.Private.Rcfd
 module Poll = Iomux.Poll
+module Eventfd = Posix_eventfd
+open Sched_common
 
 type exit = [`Exit_scheduler]
-
-(* The type of items in the run queue. *)
-type runnable =
-  | IO : runnable                                       (* Reminder to check for IO *)
-  | Thread : 'a Suspended.t * 'a -> runnable            (* Resume a fiber with a result value *)
-  | Failed_thread : 'a Suspended.t * exn -> runnable    (* Resume a fiber with an exception *)
-
-(* For each FD we track which fibers are waiting for it to become readable/writeable. *)
-type fd_event_waiters = {
-  read : unit Suspended.t Lwt_dllist.t;
-  write : unit Suspended.t Lwt_dllist.t;
-}
 
 type t = {
   (* The queue of runnable fibers ready to be resumed. Note: other domains can also add work items here. *)
@@ -46,10 +36,9 @@ type t = {
 
   (* When adding to [run_q] from another domain, this domain may be sleeping and so won't see the event.
      In that case, [need_wakeup = true] and you must signal using [eventfd]. *)
-  eventfd : Rcfd.t;                     (* For sending events. *)
-  eventfd_r : Unix.file_descr;          (* For reading events. *)
+  eventfd : Eventfd.Owner.t;
 
-  mutable active_ops : int;             (* Exit when this is zero and [run_q] and [sleep_q] are empty. *)
+  active_ops : int Atomic.t;             (* Exit when this is zero and [run_q] and [sleep_q] are empty. *)
 
   (* If [false], the main thread will check [run_q] before sleeping again
      (possibly because an event has been or will be sent to [eventfd]).
@@ -60,29 +49,17 @@ type t = {
 
   sleep_q: Zzz.t;                       (* Fibers waiting for timers. *)
 
+  select_thread : Select.t Lazy.t;
+
   thread_pool : Eio_unix.Private.Thread_pool.t;
 }
 
-(* The message to send to [eventfd] (any character would do). *)
-let wake_buffer = Bytes.of_string "!"
 
 (* This can be called from any systhread (including ones not running Eio),
    and also from signal handlers or GC finalizers. It must not take any locks. *)
 let wakeup t =
   Atomic.set t.need_wakeup false; (* [t] will check [run_q] after getting the event below *)
-  Rcfd.use t.eventfd
-    ~if_closed:ignore       (* Domain has shut down (presumably after handling the event) *)
-    (fun fd ->
-       try
-         ignore (Unix.single_write fd wake_buffer 0 1 : int)
-       with
-       | Unix.Unix_error ((Unix.EAGAIN | EWOULDBLOCK), _, _) ->
-         (* If the pipe is full then a wake up is pending anyway. *)
-         ()
-       | Unix.Unix_error (Unix.EPIPE, _, _) ->
-         (* We're shutting down; the event has already been processed. *)
-         ()
-    )
+  Eventfd.Writer.wakeup (Eventfd.Owner.create_writer t.eventfd)
 
 (* Safe to call from anywhere (other systhreads, domains, signal handlers, GC finalizers) *)
 let enqueue_thread t k x =
@@ -106,11 +83,22 @@ let get_waiters t fd =
     Hashtbl.add t.fd_map fd x;
     x
 
-(* The OS told us that the event pipe is ready. Remove events. *)
-let clear_event_fd t =
-  let buf = Bytes.create 8 in   (* Read up to 8 events at a time *)
-  let got = Unix.read t.eventfd_r buf 0 (Bytes.length buf) in
-  assert (got > 0)
+
+let remove_fd t fd index = 
+    Poll.invalidate_index t.poll index;
+    (* Try to find the new maxi, go back on index until we find the next
+       used slot, -1 means none in use. *)
+    let rec lower_maxi = function
+      | -1 -> t.poll_maxi <- -1
+      | index ->
+        if Poll.((get_fd t.poll index) <> invalid_fd) then
+          t.poll_maxi <- index
+        else
+          lower_maxi (pred index)
+    in
+    if index = t.poll_maxi then
+      lower_maxi (pred index);
+    Hashtbl.remove t.fd_map fd
 
 (* Update [t.poll]'s entry for [fd] to match [waiters]. *)
 let update t waiters fd =
@@ -124,20 +112,7 @@ let update t waiters fd =
     | true, true -> Poll.Flags.(pollin + pollout)
   in
   if flags = Poll.Flags.empty then (
-    Poll.invalidate_index t.poll fdi;
-    (* Try to find the new maxi, go back on index until we find the next
-       used slot, -1 means none in use. *)
-    let rec lower_maxi = function
-      | -1 -> t.poll_maxi <- -1
-      | index ->
-        if Poll.((get_fd t.poll index) <> invalid_fd) then
-          t.poll_maxi <- index
-        else
-          lower_maxi (pred index)
-    in
-    if fdi = t.poll_maxi then
-      lower_maxi (pred fdi);
-    Hashtbl.remove t.fd_map fd
+    remove_fd t fd fdi
   ) else (
     Poll.set_index t.poll fdi fd flags;
     if fdi > t.poll_maxi then
@@ -145,28 +120,46 @@ let update t waiters fd =
   )
 
 let resume t node =
-  t.active_ops <- t.active_ops - 1;
+  Atomic.decr t.active_ops;
   let k : unit Suspended.t = Lwt_dllist.get node in
   Fiber_context.clear_cancel_fn k.fiber;
   enqueue_thread t k ()
 
 (* Called when poll indicates that an event we requested for [fd] is ready. *)
-let ready t _index fd revents =
-  assert (not Poll.Flags.(mem revents pollnval));
-  if fd == t.eventfd_r then (
-    clear_event_fd t
+let ready t index fd revents =
+  if Eventfd.Owner.is_reader fd t.eventfd then (
+    Eventfd.Owner.clear t.eventfd
     (* The scheduler will now look at the run queue again and notice any new items. *)
   ) else (
+    (* Waiters is the set of computations waiting on this fd, split into readers and writers *)
     let waiters = Hashtbl.find t.fd_map fd in
+    (* Pending *will* contain all the computations we want to wake up *)
     let pending = Lwt_dllist.create () in
-    if Poll.Flags.(mem revents (pollout + pollhup + pollerr)) then
-      Lwt_dllist.transfer_l waiters.write pending;
-    if Poll.Flags.(mem revents (pollin + pollhup + pollerr)) then
-      Lwt_dllist.transfer_l waiters.read pending;
-    (* If pending has things, it means we modified the waiters, refresh our view *)
-    if not (Lwt_dllist.is_empty pending) then
-      update t waiters fd;
-    Lwt_dllist.iter_node_r (resume t) pending
+    (* Waking Procedure:
+       1. If POLLOUT is set, wake the writers
+       2. If POLLIN is set, wake the readers
+       3. If any of POLLHUP, POLLERR, or POLLNVAL is set, wake both readers & writers.
+       On macOS, poll() returns POLLNVAL for fds it can't poll on, such as /dev/null.
+       This results in us blocking on block devices, which isn't a problem for /dev/null
+       But we may want to revisit this.
+
+       Move any readers/writers into pending
+     *)
+
+    if Poll.Flags.(mem revents pollnval) then begin
+       (* we need to remove this fd from the poll, and send it to the select watcher *)
+       Select.add_fd fd waiters (Lazy.force t.select_thread);
+       remove_fd t fd index;
+       Hashtbl.remove t.fd_map fd
+    end else begin
+      if Poll.Flags.(mem revents (pollout + pollhup + pollerr)) then
+        Lwt_dllist.transfer_l waiters.write pending;
+      if Poll.Flags.(mem revents (pollin + pollhup + pollerr)) then
+        Lwt_dllist.transfer_l waiters.read pending;
+      if not (Lwt_dllist.is_empty pending) then
+        update t waiters fd;
+      Lwt_dllist.iter_node_r (resume t) pending
+    end
   )
 
 (* Switch control to the next ready continuation.
@@ -203,7 +196,7 @@ let rec next t : [`Exit_scheduler] =
           Poll.Nanoseconds diff_ns
         | `Nothing -> Poll.Infinite
       in
-      if timeout = Infinite && t.active_ops = 0 && Lf_queue.is_empty t.run_q then (
+      if timeout = Infinite && (Atomic.get t.active_ops) = 0 && Lf_queue.is_empty t.run_q then (
         (* Nothing further can happen at this point. *)
         Lf_queue.close t.run_q;      (* Just to catch bugs if something tries to enqueue later *)
         `Exit_scheduler
@@ -237,24 +230,24 @@ let with_sched fn =
   let run_q = Lf_queue.create () in
   Lf_queue.push run_q IO;
   let sleep_q = Zzz.create () in
-  let eventfd_r, eventfd_w = Unix.pipe ~cloexec:true () in
-  Unix.set_nonblock eventfd_r;
-  Unix.set_nonblock eventfd_w;
-  let eventfd = Rcfd.make eventfd_w in
-  let cleanup () =
-    Unix.close eventfd_r;
-    let was_open = Rcfd.close eventfd in
-    assert was_open
-  in
+  let eventfd = Eventfd.Owner.create () in
   let poll = Poll.create () in
   let fd_map = Hashtbl.create 10 in
   let thread_pool = Eio_unix.Private.Thread_pool.create ~sleep_q in
-  let t = { run_q; poll; poll_maxi = (-1); fd_map; eventfd; eventfd_r;
-            active_ops = 0; need_wakeup = Atomic.make false; sleep_q; thread_pool } in
+  let active_ops = Atomic.make 0 in
+  let select_thread = Lazy.from_fun (fun () -> Select.init run_q (Eventfd.Owner.create_writer eventfd) active_ops) in
+  let t = { run_q; poll; poll_maxi = (-1); fd_map; eventfd; 
+            active_ops; need_wakeup = Atomic.make false; sleep_q; thread_pool; select_thread } in
+  let eventfd_r = Eventfd.Owner.reader_fd eventfd in
   let eventfd_ri = Iomux.Util.fd_of_unix eventfd_r in
   Poll.set_index t.poll eventfd_ri eventfd_r Poll.Flags.pollin;
   if eventfd_ri > t.poll_maxi then
     t.poll_maxi <- eventfd_ri;
+  let cleanup () =
+    if Lazy.is_val select_thread then
+      Select.cleanup (Lazy.force select_thread);
+    Eventfd.Owner.cleanup eventfd
+  in
   match fn t with
   | x -> cleanup (); x
   | exception ex ->
@@ -266,7 +259,7 @@ let await_readable t (k : unit Suspended.t) fd =
   match Fiber_context.get_error k.fiber with
   | Some e -> Suspended.discontinue k e
   | None ->
-    t.active_ops <- t.active_ops + 1;
+    Atomic.incr t.active_ops;
     let waiters = get_waiters t fd in
     let was_empty = Lwt_dllist.is_empty waiters.read in
     let node = Lwt_dllist.add_l k waiters.read in
@@ -275,7 +268,7 @@ let await_readable t (k : unit Suspended.t) fd =
         Lwt_dllist.remove node;
         if Lwt_dllist.is_empty waiters.read then
           update t waiters fd;
-        t.active_ops <- t.active_ops - 1;
+        Atomic.decr t.active_ops;
         enqueue_failed_thread t k ex
       );
     next t
@@ -284,7 +277,7 @@ let await_writable t (k : unit Suspended.t) fd =
   match Fiber_context.get_error k.fiber with
   | Some e -> Suspended.discontinue k e
   | None ->
-    t.active_ops <- t.active_ops + 1;
+    Atomic.incr t.active_ops;
     let waiters = get_waiters t fd in
     let was_empty = Lwt_dllist.is_empty waiters.write in
     let node = Lwt_dllist.add_l k waiters.write in
@@ -293,7 +286,7 @@ let await_writable t (k : unit Suspended.t) fd =
         Lwt_dllist.remove node;
         if Lwt_dllist.is_empty waiters.write then
           update t waiters fd;
-        t.active_ops <- t.active_ops - 1;
+        Atomic.decr t.active_ops;
         enqueue_failed_thread t k ex
       );
     next t
@@ -314,13 +307,13 @@ let await_timeout t (k : unit Suspended.t) time =
     next t
 
 let with_op t fn x =
-  t.active_ops <- t.active_ops + 1;
+  Atomic.incr t.active_ops;
   match fn x with
   | r ->
-    t.active_ops <- t.active_ops - 1;
+    Atomic.decr t.active_ops;
     r
   | exception ex ->
-    t.active_ops <- t.active_ops - 1;
+    Atomic.decr t.active_ops;
     raise ex
 
 [@@@alert "-unstable"]

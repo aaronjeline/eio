@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 3 sh:*)",
+      "Bash(timeout 5 sh:*)",
+      "Bash(dune build:*)"
+    ]
+  }
+}
