@@ -152,16 +152,26 @@ let resume t node =
 
 (* Called when poll indicates that an event we requested for [fd] is ready. *)
 let ready t _index fd revents =
-  assert (not Poll.Flags.(mem revents pollnval));
   if fd == t.eventfd_r then (
     clear_event_fd t
     (* The scheduler will now look at the run queue again and notice any new items. *)
   ) else (
+    (* Watiters is the set of computations waiting on this fd, split into readers and writers *)
     let waiters = Hashtbl.find t.fd_map fd in
+    (* Pending *will* contain all the computations we want to wake up *)
     let pending = Lwt_dllist.create () in
-    if Poll.Flags.(mem revents (pollout + pollhup + pollerr)) then
+
+    (* Waking Procedure:
+       1. If POLLOUT is set, wake the writers
+       2. If POLLIN is set, wake the readers
+       3. If any of POLLHUP, POLLERR, or POLLNVAL is set, wake both readers & writers.
+       On macOS, poll() returns POLLNVAL for fds it can't poll on, such as /dev/null.
+
+       Move any readers/writers into pending
+     *)
+    if Poll.Flags.(mem revents (pollout + pollhup + pollerr + pollnval)) then
       Lwt_dllist.transfer_l waiters.write pending;
-    if Poll.Flags.(mem revents (pollin + pollhup + pollerr)) then
+    if Poll.Flags.(mem revents (pollin + pollhup + pollerr + pollnval)) then
       Lwt_dllist.transfer_l waiters.read pending;
     (* If pending has things, it means we modified the waiters, refresh our view *)
     if not (Lwt_dllist.is_empty pending) then
