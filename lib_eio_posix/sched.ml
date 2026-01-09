@@ -156,7 +156,7 @@ let ready t _index fd revents =
     clear_event_fd t
     (* The scheduler will now look at the run queue again and notice any new items. *)
   ) else (
-    (* Watiters is the set of computations waiting on this fd, split into readers and writers *)
+    (* Waiters is the set of computations waiting on this fd, split into readers and writers *)
     let waiters = Hashtbl.find t.fd_map fd in
     (* Pending *will* contain all the computations we want to wake up *)
     let pending = Lwt_dllist.create () in
