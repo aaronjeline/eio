@@ -166,6 +166,8 @@ let ready t _index fd revents =
        2. If POLLIN is set, wake the readers
        3. If any of POLLHUP, POLLERR, or POLLNVAL is set, wake both readers & writers.
        On macOS, poll() returns POLLNVAL for fds it can't poll on, such as /dev/null.
+       This results in us blocking on block devices, which isn't a problem for /dev/null
+       But we may want to revisit this.
 
        Move any readers/writers into pending
      *)
